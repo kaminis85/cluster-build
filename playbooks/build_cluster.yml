@@ -1,0 +1,319 @@
+---
+# Lab build of a 2-node ONTAP cluster. Values are in vars/lab.yml.
+# The playbook asks for the admin password once. That password is set on
+# both consoles and used for every login after that.
+#
+#   1. On each console: boot_ontap if needed, set node-mgmt, exit the wizard.
+#   2. POST /api/cluster on the first node with the admin password, both nodes,
+#      and the cluster-mgmt address. Node 2 joins in that same request.
+#   3. Apply DNS, the default route, location, and the cluster-mgmt port.
+#
+#   ansible-playbook playbooks/build_cluster.yml
+
+- name: Build a 2-node ONTAP cluster
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/lab.yml
+  vars_prompt:
+    - name: admin_password
+      prompt: "Cluster admin password (user admin)"
+      private: true
+      confirm: true
+  module_defaults:
+    group/netapp.ontap.netapp_ontap:
+      hostname: "{{ nodes[0].mgmt_ip }}"
+      username: "{{ admin_username }}"
+      password: "{{ admin_password }}"
+      https: true
+      validate_certs: false
+      use_rest: always
+
+  tasks:
+    - name: Check lab values
+      ansible.builtin.assert:
+        that:
+          - admin_password | length >= 8
+          - admin_password is match('.*[A-Z].*')
+          - admin_password is match('.*[a-z].*')
+          - admin_password is match('.*[0-9].*')
+          - admin_password is match('.*[^A-Za-z0-9].*')
+          - nodes | length == 2
+          - nodes | map(attribute='mgmt_ip') | list | unique | length == 2
+          - not bootstrap_console or (nodes | map(attribute='console_command') | select('search', 'REPLACE_ME') | list | length == 0)
+        fail_msg: >-
+          The admin password must meet the ONTAP password policy. vars/lab.yml
+          must list exactly two nodes with different mgmt IPs. When
+          bootstrap_console is true, both console commands must be real.
+
+    - name: Check that pexpect is installed
+      ansible.builtin.command: python3 -c "import pexpect"
+      changed_when: false
+      when: bootstrap_console | default(true) | bool
+
+    - name: Put a node-mgmt IP on each node from the console
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/ontap_console.py"
+          - --command
+          - "{{ item.console_command }}"
+          - --username
+          - "{{ admin_username }}"
+          - --node-mgmt-port
+          - "{{ item.mgmt_port | default(node_mgmt_port) }}"
+          - --node-mgmt-ip
+          - "{{ item.mgmt_ip }}"
+          - --node-mgmt-netmask
+          - "{{ item.mgmt_netmask | default(node_mgmt_netmask) }}"
+          - --node-mgmt-gateway
+          - "{{ item.mgmt_gateway | default(node_mgmt_gateway) }}"
+          - --timeout
+          - "1500"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.mgmt_ip }}"
+      environment:
+        ONTAP_ADMIN_PASSWORD: "{{ admin_password }}"
+        ONTAP_LOGIN_PASSWORD: "{{ node_login_password }}"
+        ONTAP_SSH_PASSWORD: "{{ item.console_ssh_password | default('') }}"
+      when: bootstrap_console | default(true) | bool
+
+    - name: Wait until every node-mgmt address answers on HTTPS
+      ansible.builtin.wait_for:
+        host: "{{ item.mgmt_ip }}"
+        port: 443
+        timeout: 300
+        delay: 5
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.mgmt_ip }}"
+
+    - name: Discover cluster-network addresses from the first node
+      ansible.builtin.uri:
+        url: "https://{{ nodes[0].mgmt_ip }}/api/cluster/nodes?fields=name,uuid,membership,cluster_interfaces,management_interfaces&return_timeout=30"
+        method: GET
+        url_username: "{{ admin_username }}"
+        url_password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+        timeout: 60
+      register: discover
+      retries: 12
+      delay: 20
+      until: >-
+        discover is succeeded and (discover.json.num_records | default(0) | int) >= 2
+
+    - name: Show nodes visible before create
+      ansible.builtin.debug:
+        msg: "{{ discover.json.records | default([]) }}"
+
+    - name: Match node 1 by its management IP
+      ansible.builtin.set_fact:
+        seed_record: "{{ item }}"
+      loop: "{{ discover.json.records | default([]) }}"
+      when:
+        - seed_record is not defined
+        - item.cluster_interfaces | default([]) | length > 0
+        - item.management_interfaces | default([]) | length > 0
+        - (item.management_interfaces[0].ip.address | default('')) == nodes[0].mgmt_ip
+
+    - name: Otherwise treat the only node that has a management IP as node 1
+      ansible.builtin.set_fact:
+        seed_record: "{{ with_mgmt[0] }}"
+      vars:
+        with_mgmt: "{{ discover.json.records | default([]) | selectattr('management_interfaces', 'defined') | selectattr('cluster_interfaces', 'defined') | list }}"
+      when:
+        - seed_record is not defined
+        - with_mgmt | length == 1
+
+    - name: Match node 2 by its management IP
+      ansible.builtin.set_fact:
+        partner_record: "{{ item }}"
+      loop: "{{ discover.json.records | default([]) }}"
+      when:
+        - partner_record is not defined
+        - seed_record is defined
+        - item.cluster_interfaces | default([]) | length > 0
+        - (item.uuid | default(item.name | default(''))) != (seed_record.uuid | default(seed_record.name | default('seed')))
+        - item.management_interfaces | default([]) | length > 0
+        - (item.management_interfaces[0].ip.address | default('')) == nodes[1].mgmt_ip
+
+    - name: Otherwise use the other discovered node as node 2
+      ansible.builtin.set_fact:
+        partner_record: "{{ item }}"
+      loop: "{{ discover.json.records | default([]) }}"
+      when:
+        - partner_record is not defined
+        - seed_record is defined
+        - item.cluster_interfaces | default([]) | length > 0
+        - (item.uuid | default(item.name | default(''))) != (seed_record.uuid | default(seed_record.name | default('seed')))
+
+    - name: Stop if either node has no cluster-network address
+      ansible.builtin.fail:
+        msg: >-
+          Both controllers must be booted and their cluster ports linked
+          before create. Discovery from {{ nodes[0].mgmt_ip }} did not return
+          a cluster-network address for each node.
+          Records: {{ discover.json.records | default([]) }}
+      when: >-
+        seed_record is not defined
+        or partner_record is not defined
+        or (seed_record.cluster_interfaces | default([]) | length) == 0
+        or (partner_record.cluster_interfaces | default([]) | length) == 0
+
+    - name: Create the cluster
+      ansible.builtin.uri:
+        url: "https://{{ nodes[0].mgmt_ip }}/api/cluster?keep_precluster_config=true"
+        method: POST
+        url_username: "{{ admin_username }}"
+        url_password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code:
+          - 200
+          - 202
+        timeout: 120
+        headers:
+          Accept: application/json
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "{{ cluster_name }}"
+          password: "{{ admin_password }}"
+          location: "{{ cluster_location }}"
+          management_interface:
+            ip:
+              address: "{{ cluster_mgmt_ip }}"
+              netmask: "{{ cluster_mgmt_netmask }}"
+              gateway: "{{ cluster_mgmt_gateway }}"
+          nodes:
+            - name: "{{ seed_record.name }}"
+              management_interface:
+                ip:
+                  address: "{{ nodes[0].mgmt_ip }}"
+              cluster_interface:
+                ip:
+                  address: "{{ seed_record.cluster_interfaces[0].ip.address }}"
+            - name: "{{ partner_record.name }}"
+              management_interface:
+                ip:
+                  address: "{{ nodes[1].mgmt_ip }}"
+              cluster_interface:
+                ip:
+                  address: "{{ partner_record.cluster_interfaces[0].ip.address }}"
+      register: create_cluster
+
+    - name: Wait until cluster create finishes
+      ansible.builtin.uri:
+        url: "https://{{ nodes[0].mgmt_ip }}/api/cluster/jobs/{{ create_cluster.json.job.uuid }}"
+        method: GET
+        url_username: "{{ admin_username }}"
+        url_password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+        timeout: 120
+      register: create_job
+      retries: 40
+      delay: 15
+      until: create_job.json.state | default('') in ['success', 'failure']
+
+    - name: Stop if cluster create failed
+      ansible.builtin.fail:
+        msg: >-
+          Cluster create failed:
+          {{ create_job.json.message | default(create_job.json.error | default(create_job.json)) }}
+      when: create_job.json.state != 'success'
+
+    - name: Read node names after join
+      ansible.builtin.uri:
+        url: "https://{{ nodes[0].mgmt_ip }}/api/cluster/nodes?fields=name,management_interfaces"
+        method: GET
+        url_username: "{{ admin_username }}"
+        url_password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: members
+
+    - name: Pick the first node as the home node for cluster-mgmt
+      ansible.builtin.set_fact:
+        home_node: "{{ item.name }}"
+      loop: "{{ members.json.records | default([]) }}"
+      when:
+        - home_node is not defined
+        - item.management_interfaces | default([]) | length > 0
+        - item.management_interfaces[0].ip.address | default('') == nodes[0].mgmt_ip
+
+    - name: Fall back to the first node name
+      ansible.builtin.set_fact:
+        home_node: "{{ members.json.records[0].name }}"
+      when:
+        - home_node is not defined
+        - members.json.records | default([]) | length > 0
+
+    - name: Create the cluster-mgmt LIF
+      netapp.ontap.na_ontap_interface:
+        state: present
+        interface_name: cluster_mgmt
+        interface_type: ip
+        ipspace: Default
+        home_node: "{{ home_node }}"
+        home_port: "{{ cluster_mgmt_port }}"
+        address: "{{ cluster_mgmt_ip }}"
+        netmask: "{{ cluster_mgmt_netmask }}"
+        service_policy: default-management
+        failover_policy: broadcast-domain-wide
+        is_auto_revert: true
+
+    - name: Add the cluster-mgmt default route
+      netapp.ontap.na_ontap_net_routes:
+        state: present
+        vserver: "{{ cluster_name }}"
+        destination: "0.0.0.0/0"
+        gateway: "{{ cluster_mgmt_gateway }}"
+
+    - name: Configure DNS
+      netapp.ontap.na_ontap_dns:
+        state: present
+        vserver: "{{ cluster_name }}"
+        domains: "{{ dns_domains }}"
+        nameservers: "{{ dns_servers }}"
+
+    - name: Set the cluster location
+      netapp.ontap.na_ontap_cluster:
+        state: present
+        cluster_name: "{{ cluster_name }}"
+        cluster_location: "{{ cluster_location }}"
+
+    - name: Read the cluster back
+      ansible.builtin.uri:
+        url: "https://{{ nodes[0].mgmt_ip }}/api/cluster?fields=name,location,management_interfaces"
+        method: GET
+        url_username: "{{ admin_username }}"
+        url_password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: cluster_info
+
+    - name: Read cluster membership
+      ansible.builtin.uri:
+        url: "https://{{ nodes[0].mgmt_ip }}/api/cluster/nodes?fields=name,membership,ha"
+        method: GET
+        url_username: "{{ admin_username }}"
+        url_password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: node_info
+
+    - name: Report the cluster
+      ansible.builtin.debug:
+        msg:
+          - "Cluster {{ cluster_info.json.name | default(cluster_name) }} location {{ cluster_info.json.location | default('') }}"
+          - "Cluster mgmt {{ cluster_mgmt_ip }} on {{ cluster_mgmt_port }} via {{ home_node }}"
+          - "Node 2 {{ nodes[1].mgmt_ip }} joined via {{ partner_record.cluster_interfaces[0].ip.address }}"
+          - "Nodes {{ node_info.json.records | default([]) | map(attribute='name') | list }}"
