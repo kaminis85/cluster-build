@@ -1,7 +1,7 @@
 ---
 # Lab build of a 2-node ONTAP cluster. Values are in vars/lab.yml.
-# The playbook asks for the admin password once. That password is set on
-# both consoles and used for every login after that.
+# The admin password from vars/lab.yml is set on both consoles and used for
+# every login after that.
 #
 #   1. On each console: boot_ontap if needed, set node-mgmt, exit the wizard.
 #   2. POST /api/cluster on the first node with the admin password, both nodes,
@@ -15,11 +15,6 @@
   gather_facts: false
   vars_files:
     - ../vars/lab.yml
-  vars_prompt:
-    - name: admin_password
-      prompt: "Cluster admin password (user admin)"
-      private: true
-      confirm: true
   module_defaults:
     group/netapp.ontap.netapp_ontap:
       hostname: "{{ nodes[0].mgmt_ip }}"

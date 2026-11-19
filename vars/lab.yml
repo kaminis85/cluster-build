@@ -1,39 +1,42 @@
 ---
-# Lab values for a 2-node cluster. The playbook asks for the admin password
-# at startup. That password is set on both consoles and used to log in.
-# 192.0.2.0/24 is a documentation range. Replace it with the lab subnet.
+# Lab values for the FPSA-A400-PLT 2-node cluster.
 # The first node creates the cluster. The second node joins it.
+# The file contains the admin password. Do not commit it.
 
 admin_username: admin
+admin_password: "NetApp!23"
+
 # Factory console password. Blank until this playbook sets admin_password.
 node_login_password: ""
 
-cluster_name: labcluster
-cluster_location: "lab"
+cluster_name: FPSA-A400-PLT
+cluster_location: "NetApp Lab RTP/1/Eng 1/G/3"
 
-# Shared node-mgmt network. A node may override port, netmask, or gateway.
+# Node-mgmt network. Port, netmask, and gateway are shared by both nodes.
 node_mgmt_port: e0M
 node_mgmt_netmask: "255.255.255.0"
-node_mgmt_gateway: "192.0.2.1"
+node_mgmt_gateway: "172.22.24.1"
 
 nodes:
-  - mgmt_ip: "192.0.2.11"
-    console_command: "ssh -tt -o StrictHostKeyChecking=accept-new REPLACE_ME_NODE1_CONSOLE"
+  - mgmt_ip: "172.22.24.11"
+    console_command: "REPLACE_ME_NODE1_CONSOLE_COMMAND"
     console_ssh_password: ""
-  - mgmt_ip: "192.0.2.12"
-    console_command: "ssh -tt -o StrictHostKeyChecking=accept-new REPLACE_ME_NODE2_CONSOLE"
+  - mgmt_ip: "172.22.24.12"
+    console_command: "REPLACE_ME_NODE2_CONSOLE_COMMAND"
     console_ssh_password: ""
 
-# Cluster management. Port is pre-populated with e0M, as in the wizard.
+# Cluster management. Port is e0M, as in the wizard. Netmask and gateway
+# match the node-mgmt network.
 cluster_mgmt_port: e0M
-cluster_mgmt_ip: "192.0.2.10"
+cluster_mgmt_ip: "172.22.24.10"
 cluster_mgmt_netmask: "255.255.255.0"
-cluster_mgmt_gateway: "192.0.2.1"
+cluster_mgmt_gateway: "172.22.24.1"
 
 dns_domains:
-  - lab.example.com
+  - fpmc.sa
 dns_servers:
-  - "192.0.2.53"
+  - "10.61.176.251"
+  - "10.61.176.252"
 
 # Set false to skip the consoles and only run create/join, after every
 # node already has its node-mgmt IP.
